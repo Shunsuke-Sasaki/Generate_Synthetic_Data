@@ -8,20 +8,38 @@ merge_similar_jsonl.py
 各グループを 1 行の JSON として出力（JSONL）。
 連結テキストは最大 max_chars（既定 20000）を超えた分は切り捨て。
 
-グルーピングは「クラスタの重心と類似度 >= 閾値」で割り当てる貪欲法（高速・省メモリ）。
+ポイント:
+- 改行があっても、既に \\n を削除済みでも同様に動作するよう raw を正規化
+- 実改行/CRLF/タブ/リテラル \\n \\r \\t をスペース化し、空白を1個に圧縮
+- 多言語E5 (intfloat/multilingual-e5-base) で埋め込み
 """
 
 import argparse
 import json
 import sys
+import re
 from pathlib import Path
 from typing import List, Tuple
 import numpy as np
 from tqdm import tqdm
 
-# sentence-transformers（多言語E5）
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer  # pip install sentence-transformers tqdm
 
+# ---------- 正規化 ----------
+WS_RE = re.compile(r'\s+')
+ESCAPED_WS_RE = re.compile(r'\\[nrt]')  # \n, \r, \t (リテラル)
+
+def normalize_raw(text: str) -> str:
+    """実改行/タブ/CRLF とリテラル \\n \\r \\t をスペース化、空白圧縮。"""
+    if not isinstance(text, str):
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    t = ESCAPED_WS_RE.sub(" ", t)       # リテラル \n, \r, \t → space
+    t = t.replace("\n", " ")            # 実改行 → space
+    t = WS_RE.sub(" ", t)               # 連続空白を1つに
+    return t.strip()
+
+# ---------- I/O ----------
 def read_jsonl(path: Path) -> List[Tuple[str, str]]:
     items = []
     with path.open("r", encoding="utf-8") as f:
@@ -32,8 +50,10 @@ def read_jsonl(path: Path) -> List[Tuple[str, str]]:
             obj = json.loads(line)
             uid = obj.get("uid")
             raw = obj.get("raw")
-            if isinstance(uid, str) and isinstance(raw, str) and raw.strip():
-                items.append((uid, raw.strip()))
+            if isinstance(uid, str) and isinstance(raw, str):
+                norm = normalize_raw(raw)
+                if norm:
+                    items.append((uid, norm))
     return items
 
 def write_jsonl(path: Path, records: List[dict]):
@@ -41,6 +61,7 @@ def write_jsonl(path: Path, records: List[dict]):
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+# ---------- Embedding ----------
 def embed_texts(model_name: str, texts: List[str], batch_size: int = 64) -> np.ndarray:
     """
     E5 系は 'passage: ' を先頭に付ける運用が推奨。
@@ -56,6 +77,7 @@ def embed_texts(model_name: str, texts: List[str], batch_size: int = 64) -> np.n
     )
     return np.asarray(embs, dtype=np.float32)
 
+# ---------- Greedy clustering ----------
 def greedy_cluster(
     embeddings: np.ndarray,
     uids: List[str],
@@ -66,10 +88,10 @@ def greedy_cluster(
     貪欲クラスタリング：
     - 既存クラスタの重心（平均ベクトル）との cos 類似度が閾値以上ならそのクラスタに割り当て
     - どれも満たさなければ新規クラスタを作成
-    計算量 ~ O(N*K)（Kはクラスタ数）で大規模でも現実的。
+    計算量 ~ O(N*K)（Kはクラスタ数）
     """
-    clusters = []            # 各クラスタのメンバー index のリスト
-    centroid_sums = []       # 各クラスタのベクトル和（正規化前） shape=(d,)
+    clusters = []            # 各クラスタのメンバー index
+    centroid_sums = []       # 各クラスタのベクトル和（正規化前）
     counts = []              # 各クラスタのメンバー数
 
     for i in tqdm(range(len(texts)), desc="Clustering"):
@@ -80,12 +102,10 @@ def greedy_cluster(
             counts.append(1)
             continue
 
-        # 重心の内積 = cos 類似度（embeddingsは正規化済み、重心は都度正規化して比較）
-        # 速度のため、重心ベクトルは sum/count → 正規化してまとめて計算
+        # 重心 = sum/count を正規化してから cos
         centroids = np.stack([(s / c) for s, c in zip(centroid_sums, counts)], axis=0)
-        # 正規化
         centroids = centroids / np.linalg.norm(centroids, axis=1, keepdims=True)
-        sims = centroids @ v  # (K, d) · (d,) -> (K,)
+        sims = centroids @ v
 
         best = int(np.argmax(sims))
         if sims[best] >= threshold:
@@ -96,9 +116,9 @@ def greedy_cluster(
             clusters.append([i])
             centroid_sums.append(v.astype(np.float32).copy())
             counts.append(1)
-
     return clusters
 
+# ---------- Build output ----------
 def build_records(
     clusters: List[List[int]],
     uids: List[str],
@@ -108,7 +128,7 @@ def build_records(
 ) -> List[dict]:
     """
     各クラスタを 1 レコード化。
-    - raw はメンバーの raw を「\n\n」で連結し、max_chars を超えた分は切り捨て
+    - raw はメンバーの raw を「\\n\\n」で連結し、max_chars を超えた分は切り捨て
     - uid は 'first' ならクラスタ先頭の uid、'concat' なら uid を結合して短縮
     """
     out = []
@@ -119,7 +139,6 @@ def build_records(
             joined = joined[:max_chars]
 
         if group_uid_strategy == "concat":
-            # 代表 uid を短縮生成（先頭と件数を混ぜる等・用途に応じて調整可）
             rep_uid = f"{uids[idxs[0]]}-grp{len(idxs)}"
         else:
             rep_uid = uids[idxs[0]]
@@ -127,6 +146,7 @@ def build_records(
         out.append({"uid": rep_uid, "raw": joined})
     return out
 
+# ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, type=Path, help="入力 JSONL（各行 {uid, raw}）")
@@ -145,7 +165,7 @@ def main():
         print("no valid records", file=sys.stderr)
         sys.exit(1)
 
-    # 短文を除外（例: 壊れた 'Wh' のような行）
+    # 短文を除外（例: 'Wh' のような壊れた行）
     items = [(u, t) for (u, t) in items if len(t) >= args.min_chars]
     uids = [u for u, _ in items]
     texts = [t for _, t in items]
@@ -164,7 +184,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     write_jsonl(args.output, records)
 
-    # 簡単なレポート
+    # レポート
     sizes = [len(c) for c in clusters]
     print(f"[done] input={len(items)}, groups={len(clusters)}, "
           f"avg_group_size={np.mean(sizes):.2f}, threshold={args.threshold}")
