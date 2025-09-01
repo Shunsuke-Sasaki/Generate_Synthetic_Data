@@ -18,6 +18,7 @@ entigraph.py  —  Synthetic CPT (EntiGraph) 生成パイプライン（堅牢�
 import os
 import sys
 import json
+import ast
 import random
 import re
 import time
@@ -128,6 +129,58 @@ def _try_parse_entities_obj(text: str) -> Optional[dict]:
     t = sanitize_completion(text)
     t = _strip_code_fences(t)
 
+    # 1) 素直に JSON パース
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, dict) and "entities" in obj:
+            return obj
+    except Exception:
+        pass
+
+    # 2) 本文から {...} 抜き出して JSON パース
+    block = _extract_json_object(t)
+    if block:
+        try:
+            obj = json.loads(block)
+            if isinstance(obj, dict) and "entities" in obj:
+                return obj
+        except Exception:
+            pass
+
+    # 3) Python 風 dict を救済（シングルクォート対応）
+    try:
+        maybe = block if block is not None else t
+        pyobj = ast.literal_eval(maybe)
+        if isinstance(pyobj, dict) and "entities" in pyobj:
+            ents = [e for e in (pyobj.get("entities") or []) if isinstance(e, str)]
+            summ = pyobj.get("summary") if isinstance(pyobj.get("summary"), str) else ""
+            return {"entities": ents, "summary": summ}
+    except Exception:
+        pass
+
+    # 4) 正規表現救済（ダブル/シングル両対応）
+    m = re.search(r"""['"]entities['"]\s*:\s*(\[[^\]]*\])""", t, flags=re.IGNORECASE | re.DOTALL)
+    ents = []
+    if m:
+        arr = m.group(1)
+        arr_jsonish = arr.replace("'", '"')
+        try:
+            tmp = json.loads(arr_jsonish)
+            if isinstance(tmp, list):
+                ents = [x for x in tmp if isinstance(x, str)]
+        except Exception:
+            ents = []
+
+    m2 = re.search(r"""['"]summary['"]\s*:\s*['"]([^'"]*)['"]""", t, flags=re.IGNORECASE | re.DOTALL)
+    summ = m2.group(1).strip() if m2 else ""
+
+    if ents or summ:
+        return {"entities": ents, "summary": summ}
+
+    return None
+    t = sanitize_completion(text)
+    t = _strip_code_fences(t)
+
     # 1) 直 parse
     try:
         obj = json.loads(t)
@@ -147,7 +200,7 @@ def _try_parse_entities_obj(text: str) -> Optional[dict]:
             pass
 
     # 3) 正規表現で "entities": [...] と "summary": "..." を救済抽出（最終手段）
-    m = re.search(r'"entities"\s*:\s*(\[[^\]]*\])', t, flags=re.IGNORECASE | re.DOTALL)
+    m = re.search(r"""['"]entities['"]\s*:\s*(\[[^\]]*\])""", t, flags=re.IGNORECASE | re.DOTALL)
     ents: List[str] = []
     if m:
         try:
@@ -156,7 +209,7 @@ def _try_parse_entities_obj(text: str) -> Optional[dict]:
                 ents = [x for x in tmp if isinstance(x, str)]
         except Exception:
             ents = []
-    m2 = re.search(r'"summary"\s*:\s*"([^"]*)"', t, flags=re.IGNORECASE | re.DOTALL)
+    m2 = re.search(r"""['"]summary['"]\s*:\s*['"]([^'"]*)['"]""", t, flags=re.IGNORECASE | re.DOTALL)
     summ = m2.group(1).strip() if m2 else ""
 
     if ents or summ:

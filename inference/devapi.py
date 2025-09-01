@@ -1,108 +1,97 @@
-import os, time
-from typing import Optional
-import httpx
+import os
+import json
+from typing import Optional, Dict, Any
+
+# openai v1.x 系
 from openai import OpenAI
 
-# inference/devapi.py など gptqa を定義している場所
+# ---- モデル名の正規化 ----
+ALIASES: Dict[str, str] = {
+    # gpt-oss 系
+    "gpt-oss-20b": "gpt-oss-20b",
+    "openai/gpt-oss-20b": "gpt-oss-20b",
+    "lmsys/gpt-oss-20b-bf16": "gpt-oss-20b",
+    "unsloth/gpt-oss-20b": "gpt-oss-20b",
 
-import os, httpx
-from openai import OpenAI
+    # 互換のための例（必要なら増やす）
+    "gptoss-20b": "gpt-oss-20b",
+    "gpt_oss_20b": "gpt-oss-20b",
 
-def gptqa(prompt: str,
-          openai_model_name: str,
-          system_message: str,
-          json_format: bool = False,
-          temp: float = 0.2):
-    # vLLM の OpenAI 互換サーバへ接続
-    base_url = os.getenv("OPENAI_API_BASE", "http://localhost:8000/v1")
-    api_key  = os.getenv("OPENAI_API_KEY", "EMPTY")  # ダミーでOK
-    client = OpenAI(base_url=base_url,
-                    api_key=api_key,
-                    http_client=httpx.Client(timeout=60.0))
+    # 以前の既定（誤って落ちがちだったやつ）
+    "qwen3-8b": "qwen3-8b",
+    "qwen3-8b-instruct": "qwen3-8b",
+    "qwen3": "qwen3-8b",
+    "qwen": "qwen3-8b",
+}
 
-    messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": prompt},
-    ]
-    kwargs = dict(model=openai_model_name, messages=messages, temperature=temp)
-    if json_format:
-        # vLLM のバージョンやモデルによっては未対応な場合があるため
-        # まずは設定し、ダメなら後段のフォールバックで外すのが安全
-        kwargs["response_format"] = {"type": "json_object"}
+def normalize_model_name(name: Optional[str]) -> str:
+    """
+    不明・未指定の場合は DEFAULT_OPENAI_MODEL or 'gpt-oss-20b' にフォールバック。
+    スラッシュ入りIDはベース名にしてから ALIASES で正規化。
+    """
+    default_model = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-oss-20b")
+    if not name:
+        return default_model
+    base = name.strip()
+    # 例: openai/gpt-oss-20b -> gpt-oss-20b
+    if "/" in base:
+        base = base.split("/")[-1]
+    return ALIASES.get(base, default_model)
 
-    try:
-        completion = client.chat.completions.create(**kwargs)
-    except Exception as e:
-        # JSONモード非対応時のフォールバック（純プロンプトでJSON出力させる）
-        if json_format and "response_format" in str(e):
-            kwargs.pop("response_format", None)
-            messages[0]["content"] = system_message + "\nReturn ONLY valid JSON."
-            completion = client.chat.completions.create(**kwargs)
-        else:
-            raise
-    return completion.choices[0].message.content
+# ---- OpenAI クライアント ----
+def _client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY", "sk-LOCAL-ANYTHING")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    # vLLM の OpenAI 互換エンドポイントを使う場合は /v1 まで入っていること
+    return OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
 
-
-
-"""
+# ---- メイン呼び出し ----
 def gptqa(
     prompt: str,
-    openai_model_name: str,
-    system_message: str,
+    model: Optional[str] = None,
+    system_message: Optional[str] = None,
     json_format: bool = False,
-    temp: float = 0.2,
-    timeout: float = 60.0,
-    max_tokens: Optional[int] = None,
-    max_retries: int = 5,
-):
-    
-    Return: string (model output). entigraph.py 側で json.loads() される前提。
-    set_openai_key() が先に呼ばれて OPENAI_API_KEY が入っていることを想定。
-    
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+    extra_create_kwargs: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    prompt を投げて応答を返すヘルパ。
+    - json_format=True のとき、応答本文を JSON としてパースして返す（失敗時は例外）
+    - それ以外はテキスト（str）を返す
+    """
+    mdl = normalize_model_name(model)
+    messages = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
+    messages.append({"role": "user", "content": prompt})
 
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    http_client = httpx.Client(proxies=proxy, timeout=timeout) if proxy else httpx.Client(timeout=timeout)
-    client = OpenAI(api_key=api_key, http_client=http_client)
-
-    messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": prompt},
-    ]
     kwargs = {
-        "model": openai_model_name,
+        "model": mdl,
         "messages": messages,
-        "temperature": temp,
+        # 必要に応じてパラメータをここで固定化
+        # "temperature": 0.2,
+        # "max_tokens": 1024,
     }
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-    if json_format:
-        # JSON専用出力（対応モデルでは純JSONが返る）
-        kwargs["response_format"] = {"type": "json_object"}
 
-    backoff = 1.0
-    last_err = None
-    for _ in range(max_retries):
-        try:
-            resp = client.chat.completions.create(**kwargs)
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            msg = str(e)
-            last_err = e
-            # response_format非対応などで弾かれたらフォールバック
-            if json_format and ("response_format" in msg or "not supported" in msg):
-                kwargs.pop("response_format", None)
-                # 出力をJSON限定する追加指示
-                messages[0]["content"] = system_message + "\nReturn only valid JSON with no extra text."
-                kwargs["messages"] = messages
-            # レート/一時的エラーはリトライ
-            if any(s in msg for s in ("429", "Rate limit", "502", "503", "504", "timeout", "Temporary")):
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-                continue
-            # それ以外は即時エラー
-            raise
-    raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
-"""
+    # ★ json_format を指定されたら JSON を強制 & 安定化
+    if json_format:
+        kwargs.setdefault("response_format", {"type": "json_object"})
+        kwargs.setdefault("temperature", 0.0)
+        kwargs.setdefault("top_p", 1.0)
+
+    if extra_create_kwargs:
+        kwargs.update(extra_create_kwargs)
+
+    client = _client()
+    resp = client.chat.completions.create(**kwargs)
+    content = resp.choices[0].message.content or ""
+
+    if json_format:
+        # 余分なコードブロックフェンスなどを取り除いて JSON を試みる
+        txt = content.strip()
+        if txt.startswith("```"):
+            # ```json ... ``` のケース
+            lines = [ln for ln in txt.splitlines() if not ln.strip().startswith("```")]
+            txt = "\n".join(lines).strip()
+        return json.loads(txt)  # 失敗時は例外をそのまま上げる
+
+    return content

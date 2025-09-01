@@ -1,0 +1,97 @@
+import os, re, json
+from typing import Any, Union
+from openai import OpenAI
+
+# ---- vLLM / OpenAI 互換設定 ----
+BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8001/v1")
+API_KEY  = os.getenv("OPENAI_API_KEY",  "dummy")  # vLLMはダミーでOK
+
+client = OpenAI(
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    timeout=120,
+    max_retries=2,
+)
+
+def _normalize_model_name(name: str) -> str:
+    n = (name or "").strip().lower().replace("_","-").replace(" ","-")
+    if n.startswith("qwen/"):  # HF名→served名
+        n = n.split("/",1)[1]
+    aliases = {
+        "qwen3-8b": "qwen3-8b",
+        "qwen3-8b-instruct": "qwen3-8b",
+        "qwen3": "qwen3-8b",
+        "qwen": "qwen3-8b",
+    }
+    return aliases.get(n, "qwen3-8b")
+
+def _extract_json(text: str) -> Any:
+    """
+    回答からJSONブロックを抽出してPythonオブジェクトに。
+    失敗したら例外を投げずに素のテキストを返す。
+    """
+    if not text:
+        return {}
+    # ```json ... ``` / {...} / [...] のいずれかを抜き出す
+    m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", text, re.S)
+    if not m:
+        m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # そのままJSONとして読める場合
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"_raw": text}
+
+def gptqa(
+    prompt: str,
+    openai_model: str,
+    system_message: str | None = None,
+    json_format: bool = False,
+    **kwargs
+) -> Union[str, dict]:
+    """
+    既存コードがこの戻り値を json.dump できるように、
+    - json_format=False: テキスト(str)を返す
+    - json_format=True : Python辞書(dict)を返す
+    """
+    model = _normalize_model_name(openai_model)
+    messages = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
+    messages.append({"role": "user", "content": prompt})
+
+    # vLLM側が対応していればJSON強制も可（未対応でも無害）
+    if json_format:
+        kwargs.setdefault("response_format", {"type": "json_object"})
+        kwargs.setdefault("temperature", 0.2)
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        **kwargs,
+    )
+
+    # ChatCompletion → シリアライズ可能な形へ
+    text = (resp.choices[0].message.content or "").strip()
+
+    if json_format:
+        parsed = _extract_json(text)
+        # ついでに使用量を付けておく（任意）
+        usage = getattr(resp, "usage", None)
+        if usage:
+            parsed = {
+                "result": parsed,
+                "_usage": {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                },
+            }
+        return parsed
+    else:
+        return text

@@ -1,0 +1,64 @@
+import os
+from typing import Optional, Dict, Any, List
+from openai import OpenAI
+
+# --- 接続先設定（環境変数を最優先） ---
+BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8001/v1")
+API_KEY  = os.getenv("OPENAI_API_KEY", "dummy")  # vLLMならダミーでOK
+
+# タイムアウト/再試行は用途に応じて調整
+client = OpenAI(
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    timeout=120,     # seconds
+    max_retries=2,
+)
+
+# --- モデル名の正規化（--served-model-name に合わせる） ---
+def _normalize_model_name(name: Optional[str]) -> str:
+    n = (name or "").strip().lower()
+    base = n.replace("_", "-").replace(" ", "-")
+    # 代表1つに寄せる（必要に応じて増やしてください）
+    aliases = {
+        "qwen3-8b": "qwen3-8b",
+        "qwen/qwen3-8b": "qwen3-8b",
+        "qwen3-8b-instruct": "qwen3-8b",
+        "qwen/qwen3-8b-instruct": "qwen3-8b",
+        "qwen3-8b-chat": "qwen3-8b",
+        "qwen3-8b-awq": "qwen3-8b",
+        "qwen3-8b-instruct-awq": "qwen3-8b",
+        "qwen3": "qwen3-8b",
+        "qwen": "qwen3-8b",
+    }
+    # 最終的に既知のserved名へ
+    return aliases.get(base, "qwen3-8b")
+
+def gptqa(
+    prompt: str,
+    openai_model: Optional[str] = None,
+    system_message: Optional[str] = None,
+    json_format: bool = False,
+    **kwargs: Any,
+):
+    """
+    既存コードが呼ぶ想定の薄いラッパ。
+    - openai_model は正規化して vLLM 側の served-model-name と一致させる
+    - json_format=True のときは JSON出力強制を要求
+    """
+    model = _normalize_model_name(openai_model)
+    messages: List[Dict[str, str]] = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
+    messages.append({"role": "user", "content": prompt})
+
+    params: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if json_format:
+        params["response_format"] = {"type": "json_object"}
+
+    # 追加パラメータ（temperatureなど）があればそのまま渡す
+    params.update(kwargs)
+
+    return client.chat.completions.create(**params)

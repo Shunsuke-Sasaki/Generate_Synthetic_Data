@@ -1,0 +1,90 @@
+import os
+import json
+from typing import Optional, Dict, Any
+
+# openai v1.x 系
+from openai import OpenAI
+
+# ---- モデル名の正規化 ----
+ALIASES: Dict[str, str] = {
+    # gpt-oss 系
+    "gpt-oss-20b": "gpt-oss-20b",
+    "openai/gpt-oss-20b": "gpt-oss-20b",
+    "lmsys/gpt-oss-20b-bf16": "gpt-oss-20b",
+    "unsloth/gpt-oss-20b": "gpt-oss-20b",
+
+    # 互換のための例（必要なら増やす）
+    "gptoss-20b": "gpt-oss-20b",
+    "gpt_oss_20b": "gpt-oss-20b",
+
+    # 以前の既定（誤って落ちがちだったやつ）
+    "qwen3-8b": "qwen3-8b",
+    "qwen3-8b-instruct": "qwen3-8b",
+    "qwen3": "qwen3-8b",
+    "qwen": "qwen3-8b",
+}
+
+def normalize_model_name(name: Optional[str]) -> str:
+    """
+    不明・未指定の場合は DEFAULT_OPENAI_MODEL or 'gpt-oss-20b' にフォールバック。
+    スラッシュ入りIDはベース名にしてから ALIASES で正規化。
+    """
+    default_model = os.getenv("DEFAULT_OPENAI_MODEL", "gpt-oss-20b")
+    if not name:
+        return default_model
+    base = name.strip()
+    # 例: openai/gpt-oss-20b -> gpt-oss-20b
+    if "/" in base:
+        base = base.split("/")[-1]
+    return ALIASES.get(base, default_model)
+
+# ---- OpenAI クライアント ----
+def _client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY", "sk-LOCAL-ANYTHING")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    # vLLM の OpenAI 互換エンドポイントを使う場合は /v1 まで入っていること
+    return OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+
+# ---- メイン呼び出し ----
+def gptqa(
+    prompt: str,
+    model: Optional[str] = None,
+    system_message: Optional[str] = None,
+    json_format: bool = False,
+    extra_create_kwargs: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    prompt を投げて応答を返すヘルパ。
+    - json_format=True のとき、応答本文を JSON としてパースして返す（失敗時は例外）
+    - それ以外はテキスト（str）を返す
+    """
+    mdl = normalize_model_name(model)
+    messages = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
+    messages.append({"role": "user", "content": prompt})
+
+    kwargs = {
+        "model": mdl,
+        "messages": messages,
+        # 必要に応じてパラメータをここで固定化
+        # "temperature": 0.2,
+        # "max_tokens": 1024,
+    }
+    if extra_create_kwargs:
+        kwargs.update(extra_create_kwargs)
+
+    client = _client()
+    resp = client.chat.completions.create(**kwargs)
+    content = resp.choices[0].message.content or ""
+
+    if json_format:
+        # 余分なコードブロックフェンスなどを取り除いて JSON を試みる
+        txt = content.strip()
+        if txt.startswith("```"):
+            # ```json ... ``` のケース
+            lines = [ln for ln in txt.splitlines() if not ln.strip().startswith("```")]
+            txt = "\n".join(lines).strip()
+        return json.loads(txt)  # 失敗時は例外をそのまま上げる
+
+    return content
