@@ -399,7 +399,22 @@ def generate_synthetic_data_for_document(document_index: int,
 
     # 既存出力の読み込み/初期化
     if os.path.exists(output_path):
-        output = jload(output_path)
+        try:
+            output = jload(output_path)
+        except Exception as e:
+            try:
+                if os.path.exists(output_path):
+                    sz = os.path.getsize(output_path)
+                    if sz > 0:
+                        bad = f"{output_path}.bad.{int(time.time())}"
+                        shutil.move(output_path, bad)
+                        print(f"[warn] Corrupted JSON backed up to {bad}: {e}")
+                    else:
+                        os.remove(output_path)
+                        print(f"[warn] Empty JSON removed at {output_path}: {e}")
+            except Exception as _ex:
+                print(f"[warn] Failed to handle bad JSON at {output_path}: {_ex}")
+            output = {}
         if not isinstance(output, list):
             output = [[]]
     else:

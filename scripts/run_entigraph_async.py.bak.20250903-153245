@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import argparse, asyncio, json, sys, os
+from pathlib import Path
+from typing import List, Optional
+
+SCRIPT_PATH = Path(__file__).resolve()
+REPO_ROOT   = SCRIPT_PATH.parents[1]          # .../Generate_Synthetic_Data
+PROJECT_ROOT= REPO_ROOT.parent                # .../ax-cpt
+ENTIGRAPH_PY= REPO_ROOT / "data" / "entigraph.py"  # .../Generate_Synthetic_Data/data/entigraph.py
+
+def load_uids_from_jsonl(path: Path) -> List[str]:
+    uids: List[str] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                uids.append("")
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                uids.append("")
+                continue
+            uids.append(str(obj.get("uid", "")))
+    return uids
+
+async def run_one(index: int, model_tag: str, timeout_sec: Optional[int], debug_fg: bool):
+    if not ENTIGRAPH_PY.exists():
+        raise FileNotFoundError(f"entigraph.py not found: {ENTIGRAPH_PY}")
+
+    cmd = [sys.executable, str(ENTIGRAPH_PY), str(index), "--model-name", model_tag]
+    env = os.environ.copy()
+
+    if debug_fg:
+        # 前景で標準入出力をそのまま使用（entigraph.py のprintが見える）
+        print(f"[debug] exec (fg): {cmd}  cwd={PROJECT_ROOT}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(PROJECT_ROOT)
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=None if not timeout_sec else timeout_sec)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError(f"[index={index}] timeout after {timeout_sec}s (fg)")
+        if proc.returncode != 0:
+            raise RuntimeError(f"[index={index}] entigraph.py failed (code={proc.returncode}) (fg)")
+        return ""
+
+    # 通常: 出力をバッファしつつタイムアウト付きで実行
+    print(f"[spawn] {cmd}  cwd={PROJECT_ROOT}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+    )
+
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=None if not timeout_sec else timeout_sec)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(
+            f"[index={index}] timeout after {timeout_sec}s\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"CWD: {PROJECT_ROOT}\n"
+        )
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"[index={index}] entigraph.py failed (code={proc.returncode})\n"
+            f"STDOUT:\n{out.decode(errors='ignore')}\n"
+            f"STDERR:\n{err.decode(errors='ignore')}\n"
+        )
+    return out.decode(errors="ignore")
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source-jsonl", required=True,
+                    help="例: data/dataset/source/mycorpus.jsonl  (相対ならプロジェクトルート基準)")
+    ap.add_argument("--out-dir-root", default="data/dataset/raw",
+                    help="例: data/dataset/raw  (相対ならプロジェクトルート基準)")
+    ap.add_argument("--model-tag", required=True)
+    ap.add_argument("--start", type=int, required=True)
+    ap.add_argument("--end", type=int, required=True)
+    ap.add_argument("--concurrency", type=int, default=256)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--timeout-sec", type=int, default=600,  # ← デフォ10分で強制切断
+                    help="子プロセス（entigraph.py）の実行タイムアウト（秒）。0または負値で無制限。")
+    ap.add_argument("--debug-foreground", action="store_true",
+                    help="子プロセスを前景で実行し、その出力をリアルタイム表示（疎通調査用）。")
+    args = ap.parse_args()
+
+    def resolve_under_root(p: str) -> Path:
+        q = Path(p)
+        return q if q.is_absolute() else (PROJECT_ROOT / q)
+
+    src = resolve_under_root(args.source_jsonl)
+    out_root = resolve_under_root(args.out_dir_root)
+
+    if not src.exists():
+        raise FileNotFoundError(f"source-jsonl not found: {src}")
+
+    uids = load_uids_from_jsonl(src)
+    n_total = len(uids)
+
+    out_dir = out_root / f"quality_entigraph_{args.model_tag}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    todo: List[int] = []
+    for i in range(args.start, args.end):
+        if i < 0 or i >= n_total:
+            continue
+        uid = uids[i]
+        out_path = out_dir / f"{uid}.json" if uid else None
+        if out_path and out_path.exists() and not args.force:
+            print(f"[skip] {uid} (index={i})")
+            continue
+        todo.append(i)
+
+    if not todo:
+        print("Nothing to do. (All outputs exist or range empty)")
+        return
+
+    print(f"Plan: run entigraph.py for {len(todo)} items "
+          f"(range {args.start}..{args.end}, concurrency={args.concurrency})")
+    print(f"[paths] project_root={PROJECT_ROOT}")
+    print(f"[paths] entigraph_py={ENTIGRAPH_PY}")
+    print(f"[paths] source_jsonl={src}")
+    print(f"[paths] out_dir={out_dir}")
+    if args.timeout_sec and args.timeout_sec > 0:
+        print(f"[cfg] timeout-sec={args.timeout_sec}")
+    if args.debug_foreground:
+        print(f"[cfg] debug-foreground=ON (concurrency is forced to 1)")
+        args.concurrency = 1
+
+    sem = asyncio.Semaphore(args.concurrency)
+    ok = 0
+    fail = 0
+
+    async def bound_run(i: int):
+        nonlocal ok, fail
+        async with sem:
+            try:
+                _ = await run_one(i, args.model_tag, args.timeout_sec if args.timeout_sec>0 else None, args.debug_foreground)
+                ok += 1
+                if ok % 20 == 0:
+                    print(f"[progress] ok={ok} fail={fail}")
+            except Exception as e:
+                fail += 1
+                print(f"[error] index={i}: {e}")
+
+    await asyncio.gather(*[bound_run(i) for i in todo])
+    print(f"Done. ok={ok} fail={fail}")
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import argparse, asyncio, json
+from pathlib import Path
+from typing import List
+
+def load_uids_from_jsonl(path: Path) -> List[str]:
+    uids: List[str] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                uids.append("")
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                uids.append("")
+                continue
+            uids.append(str(obj.get("uid", "")))
+    return uids
+
+async def run_one(index: int, model_tag: str):
+    proc = await asyncio.create_subprocess_exec(
+        "python", "data/entigraph.py",
+        str(index),
+        "--model-name", model_tag,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"[index={index}] entigraph.py failed (code={proc.returncode})\n"
+            f"STDOUT:\n{out.decode(errors='ignore')}\n"
+            f"STDERR:\n{err.decode(errors='ignore')}\n"
+        )
+    return out.decode(errors="ignore")
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source-jsonl", required=True)
+    ap.add_argument("--out-dir-root", default="data/dataset/raw")
+    ap.add_argument("--model-tag", required=True)
+    ap.add_argument("--start", type=int, required=True)
+    ap.add_argument("--end", type=int, required=True)
+    ap.add_argument("--concurrency", type=int, default=256)
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args()
+
+    src = Path(args.source_jsonl)
+    if not src.exists():
+        raise FileNotFoundError(src)
+
+    uids = load_uids_from_jsonl(src)
+    n_total = len(uids)
+
+    out_dir = Path(args.out_dir_root) / f"quality_entigraph_{args.model_tag}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    todo: List[int] = []
+    for i in range(args.start, args.end):
+        if i < 0 or i >= n_total:
+            continue
+        uid = uids[i]
+        out_path = out_dir / f"{uid}.json" if uid else None
+        if out_path and out_path.exists() and not args.force:
+            print(f"[skip] {uid} (index={i})")
+            continue
+        todo.append(i)
+
+    if not todo:
+        print("Nothing to do. (All outputs exist or range empty)")
+        return
+
+    print(f"Plan: run entigraph.py for {len(todo)} items "
+          f"(range {args.start}..{args.end}, concurrency={args.concurrency})")
+
+    sem = asyncio.Semaphore(args.concurrency)
+    ok = 0
+    fail = 0
+
+    async def bound_run(i: int):
+        nonlocal ok, fail
+        async with sem:
+            try:
+                _ = await run_one(i, args.model_tag)
+                ok += 1
+                if ok % 20 == 0:
+                    print(f"[progress] ok={ok} fail={fail}")
+            except Exception as e:
+                fail += 1
+                print(f"[error] index={i}: {e}")
+
+    await asyncio.gather(*[bound_run(i) for i in todo])
+    print(f"Done. ok={ok} fail={fail}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
